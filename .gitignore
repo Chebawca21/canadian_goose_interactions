@@ -1,3 +1,6 @@
 venv
 *tif
 North-East_American_Canada_goose_migration.csv
+.venv/
+.vscode/
+cufile.log
