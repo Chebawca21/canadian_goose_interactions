@@ -1,52 +1,62 @@
 import pandas as pd
-import geopandas as gpd
-from shapely import Point, LineString
+import itertools
+import numpy as np
+from datetime import datetime
+import rasterio
+from pyproj import Transformer
 
 def load_goose_csv(filename):
     df = pd.read_csv(filename)
-
-    geometry = []
-    for _, row in df.iterrows():
-        geometry.append(Point(row['location-long'], row['location-lat']))
-    
-    df = df.drop(['location-long', 'location-lat', 'event-id', 'visible', 'sensor-type', 'tag-local-identifier', 'individual-taxon-canonical-name', 'study-name'], axis='columns')
-    df = gpd.GeoDataFrame(df, geometry=geometry)
-    df.crs = "Epsg:4326"
-    df = df.to_crs(epsg=4326)
+    df = df.drop(['event-id', 'visible', 'sensor-type', 'tag-local-identifier', 'individual-taxon-canonical-name', 'study-name'], axis='columns')
     return df
 
-def group_by_goose(gdf):
-    linestrings = {}
-    animals = gdf['individual-local-identifier'].unique()
-    for animal in animals:
-        animal_gdf = gdf[gdf['individual-local-identifier'] == animal]
-        animal_gdf = animal_gdf.sort_values('timestamp')
-        linestrings[animal] = LineString(animal_gdf['geometry'].to_list())
-    
-    data = {}
-    data['animal_tag'] = []
-    data['geometry'] = []
-    for key, value in linestrings.items():
-        data['animal_tag'].append(key)
-        data['geometry'].append(value)
-    
-    new_gdf = gpd.GeoDataFrame(data)
-    new_gdf.crs = "Epsg:4326"
-    new_gdf = new_gdf.to_crs(epsg=4326)
-    return new_gdf
+def round_lat_long(df):
+    df['location-long'] = df['location-long'].apply(lambda x: np.round(x * 2, 4) / 2)
+    df['location-lat'] = df['location-lat'].apply(lambda x: np.round(x * 2, 4) / 2)
+    return df
 
-def save_intersections_to_file(gdf, foldername):
-    for _, row1 in gdf.iterrows():
-        intersections = {}
-        intersections['animal_tag1'] = []
-        intersections['animal_tag2'] = []
-        intersections['geometry'] = []
+def get_intersections(df):
+    animals = df['individual-local-identifier'].unique()
+    animal_pairs = list(itertools.combinations(animals, 2))
 
-        for _, row2 in gdf.iterrows():
-            if row1.animal_tag != row2.animal_tag:
-                intersections['animal_tag1'].append(row1.animal_tag)
-                intersections['animal_tag2'].append(row2.animal_tag)
-                intersections['geometry'].append(row1.geometry.intersection(row2.geometry))
+    bird_intersections = pd.DataFrame()
+    for animal1, animal2 in animal_pairs:
+        bird1 = df[df['individual-local-identifier'] == animal1]
+        bird2 = df[df['individual-local-identifier'] == animal2]
+        intersctions = bird1.merge(bird2, on=['location-long', 'location-lat'])
+        bird_intersections = pd.concat([bird_intersections, intersctions])
+    return bird_intersections
 
-        intersections_df = pd.DataFrame(intersections)
-        intersections_df.to_csv(f"{foldername}/{row1.animal_tag}_intersections.csv")
+def delete_false_intersections(bird_intersections, time_window=1200):
+    bird_intersections['timestamp_x'] = bird_intersections['timestamp_x'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S.%f'))
+    bird_intersections['timestamp_y'] = bird_intersections['timestamp_y'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S.%f'))
+    bird_intersections['time_diff'] = bird_intersections['timestamp_x'] - bird_intersections['timestamp_y']
+    bird_intersections['time_diff'] = bird_intersections['time_diff'].apply(lambda x: abs(x.total_seconds()))
+    bird_intersections = bird_intersections.drop(['timestamp_x', 'timestamp_y'], axis='columns')
+
+    bird_intersections = bird_intersections[bird_intersections['time_diff'] <= time_window]
+    return bird_intersections
+
+def get_val_from_tif(dat, x, y):
+    values = list(rasterio.sample.sample_gen(dat, [(x, y)]))
+    return values[0][0]
+
+def add_terrain_info(bird_interactions, filename):
+    dat = rasterio.open('land_cover_2020_30m_tif/NA_NALCMS_landcover_2020_30m/data/NA_NALCMS_landcover_2020_30m.tif')
+    transformer = Transformer.from_crs("epsg:4326", dat.crs)
+
+    terrain = []
+    for _, row in bird_interactions.iterrows():
+        x, y = transformer.transform(row['location-lat'], row['location-long'])
+        terrain.append(get_val_from_tif(dat, x, y))
+
+
+goose_file = "North-East_American_Canada_goose_migration.csv"
+tif_file = "land_cover_2020_30m_tif/NA_NALCMS_landcover_2020_30m/data/NA_NALCMS_landcover_2020_30m.tif"
+
+df = load_goose_csv(goose_file)
+df_rounded = round_lat_long(df)
+bird_intersections = get_intersections(df_rounded)
+bird_interactions = delete_false_intersections(bird_intersections)
+bird_interactions = add_terrain_info(bird_interactions, tif_file)
+bird_interactions.to_csv("bird_interactions", index=False)
